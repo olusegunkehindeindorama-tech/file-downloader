@@ -1,30 +1,4 @@
-/**
- * ============================================================
- * MAIN EMAIL PROCESSOR
- * ============================================================
- *
- * Looks for emails from:
- * olusegun.kehinde@indorama.com
- *
- * Supported subjects:
- *
- * 1. Darwinbox Download
- * 2. Reconciliation
- *
- * Darwinbox Download:
- *     Downloads the file from the link in the email
- *     and saves it to Google Drive.
- *
- * Reconciliation:
- *     Finds "Reconciliation Update.csv" attachment,
- *     reads its contents,
- *     and updates the Google Sheet.
- *
- * Other subjects:
- *     Ignored.
- *
- * Successfully processed emails are moved to Trash.
- */
+
 
 function processIndoramaEmails() {
 
