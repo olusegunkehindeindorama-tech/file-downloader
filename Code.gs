@@ -254,6 +254,11 @@ function processReconciliationMessage(message) {
 
 /* ==================================================================
  * RECONCILIATION GOOGLE SHEET PROCESSOR
+ * CSV is the complete source of truth.
+ * - Only records present in the CSV are kept.
+ * - Existing Emp+Date keys that are NOT in the CSV are removed.
+ * - Matching keys have their Reconciliation_Status updated from the CSV.
+ * - New keys from the CSV are added.
  * ================================================================== */
 
 function processReconciliationUpdate(csvData) {
@@ -268,31 +273,19 @@ function processReconciliationUpdate(csvData) {
   }
 
   const lastRow = sheet.getLastRow();
-  const lastColumn = sheet.getLastColumn();
 
-  let existingData = [];
-  if (lastRow > 1 && lastColumn >= 3) {
-    existingData = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
+  // We still read existing data only so we can report how many were removed,
+  // but the final output is driven purely by the CSV.
+  let existingCount = 0;
+  if (lastRow > 1) {
+    existingCount = lastRow - 1;
   }
 
-  Logger.log('Existing records: ' + existingData.length);
+  Logger.log('Existing records before replace: ' + existingCount);
 
-  // Build map of existing records
+  // ---------- Build final dataset exclusively from CSV ----------
+  // Key = Emp_No + Absent_Date
   const records = new Map();
-
-  for (let i = 0; i < existingData.length; i++) {
-    const row = existingData[i];
-    const employeeId = cleanValue(row[0]);
-    const date = normalizeDate(row[1]);
-    const status = cleanValue(row[2]);
-
-    if (!employeeId || !date) continue;
-
-    const key = createReconciliationKey(employeeId, date);
-    records.set(key, [employeeId, date, status]);
-  }
-
-  // Apply incoming CSV (new data always wins)
   let incomingCount = 0;
 
   for (let i = 1; i < csvData.length; i++) {
@@ -310,14 +303,10 @@ function processReconciliationUpdate(csvData) {
     incomingCount++;
   }
 
-  Logger.log('Incoming records applied: ' + incomingCount);
+  Logger.log('Incoming CSV records used: ' + incomingCount);
 
   // Convert + sort
   const finalData = Array.from(records.values());
-
-  finalData.forEach(function(r) {
-    r[1] = normalizeDate(r[1]);
-  });
 
   finalData.sort(function(a, b) {
     const empCmp = String(a[0]).localeCompare(String(b[0]));
@@ -325,9 +314,9 @@ function processReconciliationUpdate(csvData) {
     return String(a[1]).localeCompare(String(b[1]));
   });
 
-  Logger.log('Final records to write: ' + finalData.length);
+  Logger.log('Final records to write (CSV only): ' + finalData.length);
 
-  // Write back
+  // ---------- Full replace ----------
   if (lastRow > 1) {
     sheet.getRange(2, 1, lastRow - 1, 3).clearContent();
   }
@@ -341,8 +330,8 @@ function processReconciliationUpdate(csvData) {
 
   return {
     success: true,
-    existingRecords: existingData.length,
-    incomingRecords: incomingCount,
+    previousRecords: existingCount,
+    csvRecords: incomingCount,
     finalRecords: finalData.length
   };
 }
@@ -352,6 +341,10 @@ function processReconciliationUpdate(csvData) {
  * EMPLOYEE LIST FOR RECONCILIATION PROCESSOR
  * Target sheet: Emp_Details (gid = 342193858)
  * Unique key: Emp ID
+ *
+ * CSV is the complete source of truth.
+ * - All existing rows are removed.
+ * - Only the employees present in the CSV are written.
  * ================================================================== */
 
 function processEmployeeListMessage(message) {
@@ -428,14 +421,11 @@ function processEmployeeListMessage(message) {
  *   [3] Company
  *   [4] Gender
  *
- * Logic (all in memory):
- *   - Load existing sheet rows into a Map keyed by Emp ID
- *   - For every Emp ID present in the CSV → replace / update the record
- *     (TRAIN TYPE is left blank for updated/new rows because CSV does not contain it)
- *   - Keep any existing Emp IDs that are NOT in the CSV
- *   - Append brand-new Emp IDs from the CSV
- *   - Re-number S/N sequentially
- *   - Write the complete final dataset back in one operation
+ * Behaviour:
+ *   - Completely replace the sheet content with the CSV data only.
+ *   - Any employee not present in the CSV is removed.
+ *   - TRAIN TYPE I is left blank (CSV has no such column).
+ *   - S/N is re-numbered from 1.
  */
 function processEmployeeListUpdate(csvData) {
   const SPREADSHEET_ID = '1Wmo3BU1ht3VCiNx5hn0-PmrT9_VHivsnFoe6tLFAa74';
@@ -449,93 +439,54 @@ function processEmployeeListUpdate(csvData) {
   }
 
   const lastRow = sheet.getLastRow();
-  const lastColumn = Math.max(sheet.getLastColumn(), 7);
+  const previousCount = lastRow > 1 ? lastRow - 1 : 0;
 
-  // ---------- Load existing data into memory ----------
-  let existingData = [];
-  if (lastRow > 1) {
-    existingData = sheet.getRange(2, 1, lastRow - 1, 7).getValues();
-  }
+  Logger.log('Existing Emp_Details records (will be replaced): ' + previousCount);
 
-  Logger.log('Existing Emp_Details records: ' + existingData.length);
-
-  // Map: EmpID (upper) → full row array [S/N, COMPANY, EmpID, GENDER, TRAIN TYPE, Category, Emp Name]
-  const records = new Map();
-
-  for (let i = 0; i < existingData.length; i++) {
-    const row = existingData[i];
-    const empId = cleanValue(row[2]); // column C = Emp ID
-    if (!empId) continue;
-
-    const key = empId.toUpperCase();
-    records.set(key, [
-      row[0],                          // S/N (will be re-numbered later)
-      cleanValue(row[1]),              // COMPANY
-      empId,                           // Emp ID
-      cleanValue(row[3]),              // GENDER
-      cleanValue(row[4]),              // TRAIN TYPE I
-      cleanValue(row[5]),              // Category
-      cleanValue(row[6])               // Emp Name
-    ]);
-  }
-
-  // ---------- Apply incoming CSV (overwrite matching Emp IDs) ----------
-  let updatedCount = 0;
-  let newCount = 0;
+  // ---------- Build final dataset exclusively from CSV ----------
+  const records = new Map(); // key = Emp ID (upper) to collapse any duplicates in CSV
 
   for (let i = 1; i < csvData.length; i++) {
     const row = csvData[i];
     if (!row || row.length < 5) continue;
 
-    const empId   = cleanValue(row[0]);
-    const empName = cleanValue(row[1]);
-    const category= cleanValue(row[2]);
-    const company = cleanValue(row[3]);
-    const gender  = cleanValue(row[4]);
+    const empId    = cleanValue(row[0]);
+    const empName  = cleanValue(row[1]);
+    const category = cleanValue(row[2]);
+    const company  = cleanValue(row[3]);
+    const gender   = cleanValue(row[4]);
 
     if (!empId) continue;
 
     const key = empId.toUpperCase();
-    const alreadyExists = records.has(key);
-
-    // New / updated record. TRAIN TYPE left empty because CSV has no such column.
     records.set(key, [
-      0,                // S/N placeholder
-      company,
-      empId,
-      gender,
-      '',               // TRAIN TYPE I
-      category,
-      empName
+      0,          // S/N placeholder
+      company,    // COMPANY
+      empId,      // Emp ID
+      gender,     // GENDER
+      '',         // TRAIN TYPE I (not in CSV)
+      category,   // Category
+      empName     // Emp Name
     ]);
-
-    if (alreadyExists) {
-      updatedCount++;
-    } else {
-      newCount++;
-    }
   }
 
-  Logger.log('Updated existing: ' + updatedCount + ', Newly added: ' + newCount);
-
-  // ---------- Convert to array, sort, re-number S/N ----------
+  // Convert to array and sort (Company → Emp ID)
   const finalData = Array.from(records.values());
 
-  // Deterministic order: Company then Emp ID
   finalData.sort(function(a, b) {
     const compCmp = String(a[1]).localeCompare(String(b[1]));
     if (compCmp !== 0) return compCmp;
     return String(a[2]).localeCompare(String(b[2]));
   });
 
-  // Re-number S/N starting from 1
+  // Re-number S/N from 1
   for (let i = 0; i < finalData.length; i++) {
     finalData[i][0] = i + 1;
   }
 
-  Logger.log('Final Emp_Details records to write: ' + finalData.length);
+  Logger.log('Final Emp_Details records to write (CSV only): ' + finalData.length);
 
-  // ---------- Write everything back in one go ----------
+  // ---------- Full replace ----------
   if (lastRow > 1) {
     sheet.getRange(2, 1, lastRow - 1, 7).clearContent();
   }
@@ -548,9 +499,7 @@ function processEmployeeListUpdate(csvData) {
 
   return {
     success: true,
-    existingRecords: existingData.length,
-    updatedRecords: updatedCount,
-    newRecords: newCount,
+    previousRecords: previousCount,
     finalRecords: finalData.length
   };
 }
