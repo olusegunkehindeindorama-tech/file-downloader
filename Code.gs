@@ -6,7 +6,7 @@
 function processIndoramaEmails() {
   const SENDER = 'olusegun.kehinde@indorama.com';
   const FOLDER_ID = '1DZ2MYPvTR1HMSVUIE3fcCIBVLyrBqxD1';
-  const MAX_THREADS_BEFORE_SPLIT = 2; // as requested: >2 threads → 1 per trigger
+  const MAX_THREADS_BEFORE_SPLIT = 2;
 
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(15000)) {
@@ -17,8 +17,7 @@ function processIndoramaEmails() {
   try {
     const folder = DriveApp.getFolderById(FOLDER_ID);
 
-    // Search only recent non-trashed emails from the sender
-    // (adjust newer_than: if you need older mail)
+    // Recent non-trashed emails from the sender
     const query = 'from:' + SENDER + ' -in:trash newer_than:14d';
     const threads = GmailApp.search(query, 0, 50);
 
@@ -29,24 +28,18 @@ function processIndoramaEmails() {
       return;
     }
 
-    // ---- Process ONLY the first thread ----
+    // Process ONLY the first thread
     const thread = threads[0];
     processSingleThread(thread, SENDER, folder);
 
-    // ---- If more than MAX_THREADS_BEFORE_SPLIT remain, schedule continuation(s) ----
-    // Because we just processed (and possibly trashed) the first one,
-    // the next search will see the remaining threads.
+    // Schedule continuation when more threads remain
     if (threads.length > MAX_THREADS_BEFORE_SPLIT) {
-      // Schedule one continuation. The next run will again take only the first
-      // remaining thread and schedule another if needed. This keeps us at
-      // 1 thread per trigger as requested.
       scheduleContinuationTrigger();
       Logger.log(
         'More than ' + MAX_THREADS_BEFORE_SPLIT +
         ' threads were present. Scheduled a continuation trigger for the next thread.'
       );
     } else if (threads.length > 1) {
-      // 2 threads total → we already did the first; schedule one more for the last
       scheduleContinuationTrigger();
       Logger.log('One more thread remains. Scheduled continuation trigger.');
     }
@@ -93,6 +86,16 @@ function processSingleThread(thread, SENDER, folder) {
         return;
       }
 
+      // ---------- Employee List for Reconciliation (exact match) ----------
+      if (subject.toLowerCase() === 'employee list for reconciliation') {
+        const success = processEmployeeListMessage(message);
+        if (success) {
+          message.moveToTrash();
+          Logger.log('Employee List email moved to Trash.');
+        }
+        return;
+      }
+
       // Other subjects – ignore
       Logger.log('Ignoring email with subject: ' + subject);
 
@@ -105,19 +108,9 @@ function processSingleThread(thread, SENDER, folder) {
 
 /**
  * Creates a one-time time-based trigger that will call processIndoramaEmails
- * again after a short delay. This realises "one thread per trigger".
+ * again after a short delay.
  */
 function scheduleContinuationTrigger() {
-  // Clean any previous continuation triggers first to avoid accumulation
-  const existing = ScriptApp.getProjectTriggers();
-  existing.forEach(function(t) {
-    if (t.getHandlerFunction() === 'processIndoramaEmails' &&
-        t.getEventType() === ScriptApp.EventType.CLOCK) {
-      // Keep the regular recurring trigger; only delete pure one-time ones
-      // (one-time triggers have no recurrence). We simply allow a new one.
-    }
-  });
-
   ScriptApp.newTrigger('processIndoramaEmails')
     .timeBased()
     .after(2 * 60 * 1000) // 2 minutes
@@ -141,7 +134,7 @@ function cleanupOneTimeTriggers() {
 
 
 /* ==================================================================
- * DARWINBOX PROCESSOR (unchanged logic, only subject matching moved up)
+ * DARWINBOX PROCESSOR
  * ================================================================== */
 
 function processDarwinboxMessage(message, folder) {
@@ -261,7 +254,6 @@ function processReconciliationMessage(message) {
 
 /* ==================================================================
  * RECONCILIATION GOOGLE SHEET PROCESSOR
- * Optimised for large existing data (~25k rows)
  * ================================================================== */
 
 function processReconciliationUpdate(csvData) {
@@ -285,7 +277,7 @@ function processReconciliationUpdate(csvData) {
 
   Logger.log('Existing records: ' + existingData.length);
 
-  // ---------- Build map of existing records ----------
+  // Build map of existing records
   const records = new Map();
 
   for (let i = 0; i < existingData.length; i++) {
@@ -300,7 +292,7 @@ function processReconciliationUpdate(csvData) {
     records.set(key, [employeeId, date, status]);
   }
 
-  // ---------- Apply incoming CSV (new data always wins) ----------
+  // Apply incoming CSV (new data always wins)
   let incomingCount = 0;
 
   for (let i = 1; i < csvData.length; i++) {
@@ -311,10 +303,7 @@ function processReconciliationUpdate(csvData) {
     const date = normalizeDate(row[1]);
     const status = cleanValue(row[2]);
 
-    if (!employeeId || !date) {
-      // skip silently for speed on large CSVs
-      continue;
-    }
+    if (!employeeId || !date) continue;
 
     const key = createReconciliationKey(employeeId, date);
     records.set(key, [employeeId, date, status]);
@@ -323,12 +312,11 @@ function processReconciliationUpdate(csvData) {
 
   Logger.log('Incoming records applied: ' + incomingCount);
 
-  // ---------- Convert + sort ----------
+  // Convert + sort
   const finalData = Array.from(records.values());
 
-  // Pre-normalise dates once for faster sort
   finalData.forEach(function(r) {
-    r[1] = normalizeDate(r[1]); // already normalised, but ensure
+    r[1] = normalizeDate(r[1]);
   });
 
   finalData.sort(function(a, b) {
@@ -339,16 +327,13 @@ function processReconciliationUpdate(csvData) {
 
   Logger.log('Final records to write: ' + finalData.length);
 
-  // ---------- Write back (single bulk operation) ----------
+  // Write back
   if (lastRow > 1) {
     sheet.getRange(2, 1, lastRow - 1, 3).clearContent();
   }
 
   if (finalData.length > 0) {
-    // Write in one go
     sheet.getRange(2, 1, finalData.length, 3).setValues(finalData);
-
-    // Format date column
     sheet.getRange(2, 2, finalData.length, 1).setNumberFormat('M/d/yyyy');
   }
 
@@ -358,6 +343,214 @@ function processReconciliationUpdate(csvData) {
     success: true,
     existingRecords: existingData.length,
     incomingRecords: incomingCount,
+    finalRecords: finalData.length
+  };
+}
+
+
+/* ==================================================================
+ * EMPLOYEE LIST FOR RECONCILIATION PROCESSOR
+ * Target sheet: Emp_Details (gid = 342193858)
+ * Unique key: Emp ID
+ * ================================================================== */
+
+function processEmployeeListMessage(message) {
+  try {
+    const attachments = message.getAttachments();
+    Logger.log('Attachments found: ' + attachments.length);
+
+    let csvAttachment = null;
+
+    // Prefer exact name (case-insensitive)
+    attachments.forEach(function(attachment) {
+      const name = attachment.getName().trim().toLowerCase();
+      if (name === 'employee list.csv') {
+        csvAttachment = attachment;
+      }
+    });
+
+    // Fallback: any CSV
+    if (!csvAttachment) {
+      attachments.forEach(function(attachment) {
+        const name = attachment.getName().trim().toLowerCase();
+        if (!csvAttachment && name.endsWith('.csv')) {
+          csvAttachment = attachment;
+        }
+      });
+    }
+
+    if (!csvAttachment) {
+      Logger.log('No CSV attachment found in Employee List email.');
+      return false;
+    }
+
+    Logger.log('Reading attachment: ' + csvAttachment.getName());
+
+    const csvText = csvAttachment.getDataAsString('UTF-8');
+    if (!csvText.trim()) {
+      throw new Error('CSV attachment is empty.');
+    }
+
+    Logger.log('CSV size: ' + csvText.length + ' characters');
+
+    const csvData = Utilities.parseCsv(csvText);
+    if (!csvData || csvData.length < 2) {
+      throw new Error('CSV does not contain any data rows.');
+    }
+
+    Logger.log('CSV rows including header: ' + csvData.length);
+
+    const result = processEmployeeListUpdate(csvData);
+    Logger.log('Employee List processing result: ' + JSON.stringify(result));
+    return true;
+
+  } catch (err) {
+    Logger.log('Employee List ERROR: ' + err.toString());
+    return false;
+  }
+}
+
+
+/**
+ * Emp_Details sheet structure (gid 342193858):
+ *   A: S/N
+ *   B: COMPANY
+ *   C: Emp ID
+ *   D: GENDER
+ *   E: TRAIN TYPE I
+ *   F: Category
+ *   G: Emp Name
+ *
+ * Incoming CSV columns:
+ *   [0] Emp ID
+ *   [1] Emp Name
+ *   [2] Category
+ *   [3] Company
+ *   [4] Gender
+ *
+ * Logic (all in memory):
+ *   - Load existing sheet rows into a Map keyed by Emp ID
+ *   - For every Emp ID present in the CSV → replace / update the record
+ *     (TRAIN TYPE is left blank for updated/new rows because CSV does not contain it)
+ *   - Keep any existing Emp IDs that are NOT in the CSV
+ *   - Append brand-new Emp IDs from the CSV
+ *   - Re-number S/N sequentially
+ *   - Write the complete final dataset back in one operation
+ */
+function processEmployeeListUpdate(csvData) {
+  const SPREADSHEET_ID = '1Wmo3BU1ht3VCiNx5hn0-PmrT9_VHivsnFoe6tLFAa74';
+  const SHEET_ID = 342193858; // Emp_Details
+
+  const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = spreadsheet.getSheetById(SHEET_ID);
+
+  if (!sheet) {
+    throw new Error('Target sheet Emp_Details could not be found. GID: ' + SHEET_ID);
+  }
+
+  const lastRow = sheet.getLastRow();
+  const lastColumn = Math.max(sheet.getLastColumn(), 7);
+
+  // ---------- Load existing data into memory ----------
+  let existingData = [];
+  if (lastRow > 1) {
+    existingData = sheet.getRange(2, 1, lastRow - 1, 7).getValues();
+  }
+
+  Logger.log('Existing Emp_Details records: ' + existingData.length);
+
+  // Map: EmpID (upper) → full row array [S/N, COMPANY, EmpID, GENDER, TRAIN TYPE, Category, Emp Name]
+  const records = new Map();
+
+  for (let i = 0; i < existingData.length; i++) {
+    const row = existingData[i];
+    const empId = cleanValue(row[2]); // column C = Emp ID
+    if (!empId) continue;
+
+    const key = empId.toUpperCase();
+    records.set(key, [
+      row[0],                          // S/N (will be re-numbered later)
+      cleanValue(row[1]),              // COMPANY
+      empId,                           // Emp ID
+      cleanValue(row[3]),              // GENDER
+      cleanValue(row[4]),              // TRAIN TYPE I
+      cleanValue(row[5]),              // Category
+      cleanValue(row[6])               // Emp Name
+    ]);
+  }
+
+  // ---------- Apply incoming CSV (overwrite matching Emp IDs) ----------
+  let updatedCount = 0;
+  let newCount = 0;
+
+  for (let i = 1; i < csvData.length; i++) {
+    const row = csvData[i];
+    if (!row || row.length < 5) continue;
+
+    const empId   = cleanValue(row[0]);
+    const empName = cleanValue(row[1]);
+    const category= cleanValue(row[2]);
+    const company = cleanValue(row[3]);
+    const gender  = cleanValue(row[4]);
+
+    if (!empId) continue;
+
+    const key = empId.toUpperCase();
+    const alreadyExists = records.has(key);
+
+    // New / updated record. TRAIN TYPE left empty because CSV has no such column.
+    records.set(key, [
+      0,                // S/N placeholder
+      company,
+      empId,
+      gender,
+      '',               // TRAIN TYPE I
+      category,
+      empName
+    ]);
+
+    if (alreadyExists) {
+      updatedCount++;
+    } else {
+      newCount++;
+    }
+  }
+
+  Logger.log('Updated existing: ' + updatedCount + ', Newly added: ' + newCount);
+
+  // ---------- Convert to array, sort, re-number S/N ----------
+  const finalData = Array.from(records.values());
+
+  // Deterministic order: Company then Emp ID
+  finalData.sort(function(a, b) {
+    const compCmp = String(a[1]).localeCompare(String(b[1]));
+    if (compCmp !== 0) return compCmp;
+    return String(a[2]).localeCompare(String(b[2]));
+  });
+
+  // Re-number S/N starting from 1
+  for (let i = 0; i < finalData.length; i++) {
+    finalData[i][0] = i + 1;
+  }
+
+  Logger.log('Final Emp_Details records to write: ' + finalData.length);
+
+  // ---------- Write everything back in one go ----------
+  if (lastRow > 1) {
+    sheet.getRange(2, 1, lastRow - 1, 7).clearContent();
+  }
+
+  if (finalData.length > 0) {
+    sheet.getRange(2, 1, finalData.length, 7).setValues(finalData);
+  }
+
+  SpreadsheetApp.flush();
+
+  return {
+    success: true,
+    existingRecords: existingData.length,
+    updatedRecords: updatedCount,
+    newRecords: newCount,
     finalRecords: finalData.length
   };
 }
@@ -374,7 +567,6 @@ function createReconciliationKey(employeeId, date) {
 function normalizeDate(value) {
   if (value === null || value === undefined || value === '') return '';
 
-  // Already a Date object from Sheets
   if (Object.prototype.toString.call(value) === '[object Date]') {
     if (isNaN(value.getTime())) return '';
     return Utilities.formatDate(value, 'UTC', 'yyyy-MM-dd');
@@ -383,13 +575,11 @@ function normalizeDate(value) {
   const text = String(value).trim();
   if (!text) return '';
 
-  // Fast path for ISO-like strings (most common from CSV)
   const isoMatch = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (isoMatch) {
     return isoMatch[1] + '-' + isoMatch[2] + '-' + isoMatch[3];
   }
 
-  // Fallback
   const parsed = new Date(text);
   if (!isNaN(parsed.getTime())) {
     return Utilities.formatDate(parsed, 'UTC', 'yyyy-MM-dd');
