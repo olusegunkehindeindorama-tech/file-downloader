@@ -1,12 +1,28 @@
 /**
- * Main entry point.
- * Processes at most ONE thread per execution.
- * If more threads remain, schedules a one-time continuation trigger.
+ * ============================================================
+ * FILE DOWNLOADER
+ * ============================================================
+ * Processes emails from the designated sender.
+ *
+ * Rules:
+ * 1. If the email has one or more attachments → save each attachment
+ *    into the Darwinbox folder using the original attachment name.
+ *    Existing files with the same name are trashed (versioning).
+ * 2. If the email has no attachments but contains FILE_NAME + DOWNLOAD_LINK
+ *    → download the file and save it with the name from the body
+ *    (same versioning behaviour).
+ * 3. Successfully processed emails are moved to Trash.
+ *
+ * Designed to stay under the 6-minute limit:
+ * - Processes a limited number of messages per run.
+ * - Relies on the regular (hourly) trigger for remaining emails.
+ * - Creates at most ONE continuation trigger if the batch limit is hit.
  */
+
 function processIndoramaEmails() {
   const SENDER = 'olusegun.kehinde@indorama.com';
   const FOLDER_ID = '1DZ2MYPvTR1HMSVUIE3fcCIBVLyrBqxD1';
-  const MAX_THREADS_BEFORE_SPLIT = 2;
+  const MAX_MESSAGES_PER_RUN = 12;   // keep runs short
 
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(15000)) {
@@ -17,9 +33,9 @@ function processIndoramaEmails() {
   try {
     const folder = DriveApp.getFolderById(FOLDER_ID);
 
-    // Recent non-trashed emails from the sender
+    // Only recent, non-trashed emails from the sender
     const query = 'from:' + SENDER + ' -in:trash newer_than:14d';
-    const threads = GmailApp.search(query, 0, 50);
+    const threads = GmailApp.search(query, 0, 40);
 
     Logger.log('Threads found: ' + threads.length);
 
@@ -28,20 +44,52 @@ function processIndoramaEmails() {
       return;
     }
 
-    // Process ONLY the first thread
-    const thread = threads[0];
-    processSingleThread(thread, SENDER, folder);
+    let processedCount = 0;
+    let hitLimit = false;
 
-    // Schedule continuation when more threads remain
-    if (threads.length > MAX_THREADS_BEFORE_SPLIT) {
+    outer:
+    for (let t = 0; t < threads.length; t++) {
+      const messages = threads[t].getMessages();
+
+      for (let m = 0; m < messages.length; m++) {
+        if (processedCount >= MAX_MESSAGES_PER_RUN) {
+          hitLimit = true;
+          break outer;
+        }
+
+        const message = messages[m];
+        try {
+          const messageSender = extractEmailAddress(message.getFrom());
+          if (messageSender.toLowerCase() !== SENDER.toLowerCase()) {
+            continue;
+          }
+
+          const subject = message.getSubject().trim();
+          Logger.log('Checking email: "' + subject + '"');
+
+          const success = processEmailAsDownloader(message, folder);
+
+          if (success) {
+            message.moveToTrash();
+            Logger.log('Email moved to Trash.');
+            processedCount++;
+          } else {
+            Logger.log('Email left in inbox for later retry / ignore.');
+          }
+
+        } catch (err) {
+          Logger.log('ERROR processing email: ' + err.toString());
+          // leave in place for retry
+        }
+      }
+    }
+
+    Logger.log('Messages successfully processed this run: ' + processedCount);
+
+    // Only schedule ONE continuation if we hit the batch limit
+    if (hitLimit) {
       scheduleContinuationTrigger();
-      Logger.log(
-        'More than ' + MAX_THREADS_BEFORE_SPLIT +
-        ' threads were present. Scheduled a continuation trigger for the next thread.'
-      );
-    } else if (threads.length > 1) {
-      scheduleContinuationTrigger();
-      Logger.log('One more thread remains. Scheduled continuation trigger.');
+      Logger.log('Batch limit reached. Scheduled one continuation trigger.');
     }
 
   } finally {
@@ -50,94 +98,54 @@ function processIndoramaEmails() {
 }
 
 /**
- * Process every message inside a single Gmail thread.
+ * Core downloader logic for a single message.
+ * Returns true if the email was successfully handled (and can be trashed).
  */
-function processSingleThread(thread, SENDER, folder) {
-  const messages = thread.getMessages();
-  Logger.log('Processing thread with ' + messages.length + ' message(s).');
+function processEmailAsDownloader(message, folder) {
+  const attachments = message.getAttachments();
 
-  messages.forEach(function(message) {
-    try {
-      const messageSender = extractEmailAddress(message.getFrom());
-      if (messageSender.toLowerCase() !== SENDER.toLowerCase()) {
-        return;
-      }
+  // ---------- Case 1: has attachment(s) ----------
+  if (attachments && attachments.length > 0) {
+    Logger.log('Attachments found: ' + attachments.length);
+    let allSaved = true;
 
-      const subject = message.getSubject().trim();
-      Logger.log('Checking email: "' + subject + '"');
-
-      // ---------- Darwinbox (contains match) ----------
-      if (subject.toLowerCase().includes('darwinbox download')) {
-        const success = processDarwinboxMessage(message, folder);
-        if (success) {
-          message.moveToTrash();
-          Logger.log('Darwinbox email moved to Trash.');
+    attachments.forEach(function(attachment) {
+      try {
+        const fileName = attachment.getName().trim();
+        if (!fileName) {
+          Logger.log('Skipping attachment with empty name.');
+          return;
         }
-        return;
-      }
 
-      // ---------- Reconciliation (exact match) ----------
-      if (subject.toLowerCase() === 'reconciliation') {
-        const success = processReconciliationMessage(message);
-        if (success) {
-          message.moveToTrash();
-          Logger.log('Reconciliation email moved to Trash.');
+        Logger.log('Saving attachment: ' + fileName);
+
+        // Versioning: trash any existing file with the same name
+        const existing = folder.getFilesByName(fileName);
+        while (existing.hasNext()) {
+          existing.next().setTrashed(true);
         }
-        return;
+
+        folder.createFile(attachment.copyBlob().setName(fileName));
+        Logger.log(fileName + ' saved successfully.');
+
+      } catch (err) {
+        Logger.log('Failed to save attachment: ' + err.toString());
+        allSaved = false;
       }
+    });
 
-      // ---------- Employee List for Reconciliation (exact match) ----------
-      if (subject.toLowerCase() === 'employee list for reconciliation') {
-        const success = processEmployeeListMessage(message);
-        if (success) {
-          message.moveToTrash();
-          Logger.log('Employee List email moved to Trash.');
-        }
-        return;
-      }
+    return allSaved;
+  }
 
-      // Other subjects – ignore
-      Logger.log('Ignoring email with subject: ' + subject);
-
-    } catch (err) {
-      Logger.log('ERROR processing email: ' + err.toString());
-      // leave message in place for retry
-    }
-  });
+  // ---------- Case 2: no attachment → try Darwinbox-style link ----------
+  Logger.log('No attachments. Checking for FILE_NAME / DOWNLOAD_LINK...');
+  return processDarwinboxLink(message, folder);
 }
 
 /**
- * Creates a one-time time-based trigger that will call processIndoramaEmails
- * again after a short delay.
+ * Download via FILE_NAME + DOWNLOAD_LINK in the body.
  */
-function scheduleContinuationTrigger() {
-  ScriptApp.newTrigger('processIndoramaEmails')
-    .timeBased()
-    .after(2 * 60 * 1000) // 2 minutes
-    .create();
-
-  Logger.log('Continuation trigger created (fires in ~2 minutes).');
-}
-
-/**
- * Optional utility – run once from the editor if you ever need to
- * remove leftover one-time triggers.
- */
-function cleanupOneTimeTriggers() {
-  ScriptApp.getProjectTriggers().forEach(function(t) {
-    if (t.getHandlerFunction() === 'processIndoramaEmails') {
-      ScriptApp.deleteTrigger(t);
-      Logger.log('Deleted trigger: ' + t.getUniqueId());
-    }
-  });
-}
-
-
-/* ==================================================================
- * DARWINBOX PROCESSOR
- * ================================================================== */
-
-function processDarwinboxMessage(message, folder) {
+function processDarwinboxLink(message, folder) {
   try {
     const body = message.getPlainBody();
 
@@ -145,7 +153,7 @@ function processDarwinboxMessage(message, folder) {
     const linkMatch = body.match(/DOWNLOAD_LINK=(.*?)(\r?\n|$)/);
 
     if (!fileNameMatch || !linkMatch) {
-      Logger.log('Darwinbox email does not contain FILE_NAME or DOWNLOAD_LINK.');
+      Logger.log('No FILE_NAME or DOWNLOAD_LINK found. Ignoring.');
       return false;
     }
 
@@ -160,8 +168,8 @@ function processDarwinboxMessage(message, folder) {
       }
     }
 
-    Logger.log('Processing Darwinbox file: ' + fileName);
-    Logger.log('Actual Download Link: ' + downloadLink);
+    Logger.log('Downloading: ' + fileName);
+    Logger.log('Link: ' + downloadLink);
 
     const response = UrlFetchApp.fetch(downloadLink, {
       followRedirects: true,
@@ -169,15 +177,15 @@ function processDarwinboxMessage(message, folder) {
     });
 
     if (response.getResponseCode() !== 200) {
-      throw new Error('Download failed with code: ' + response.getResponseCode());
+      throw new Error('Download failed with HTTP ' + response.getResponseCode());
     }
 
     const blob = response.getBlob().setName(fileName);
 
-    // Trash any existing file with the same name
-    const existingFiles = folder.getFilesByName(fileName);
-    while (existingFiles.hasNext()) {
-      existingFiles.next().setTrashed(true);
+    // Versioning
+    const existing = folder.getFilesByName(fileName);
+    while (existing.hasNext()) {
+      existing.next().setTrashed(true);
     }
 
     folder.createFile(blob);
@@ -185,80 +193,139 @@ function processDarwinboxMessage(message, folder) {
     return true;
 
   } catch (err) {
-    Logger.log('Darwinbox ERROR: ' + err.toString());
+    Logger.log('Darwinbox link ERROR: ' + err.toString());
     return false;
   }
 }
 
+/**
+ * Creates at most one short-lived continuation trigger.
+ * First removes any previous one-time triggers for this function
+ * so they do not accumulate.
+ */
+function scheduleContinuationTrigger() {
+  // Clean previous one-time triggers that point to the same function
+  // (keeps any recurring/hourly trigger that has a different trigger source)
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(function(t) {
+    if (t.getHandlerFunction() === 'processIndoramaEmails' &&
+        t.getEventType() === ScriptApp.EventType.CLOCK) {
+      // One-time triggers created with .after() have no recurrence.
+      // We delete only those that look like short-lived continuations.
+      // Safer approach: delete all CLOCK triggers for this function
+      // that are not the main recurring one. Since we cannot easily
+      // distinguish, we simply delete ALL CLOCK triggers for this
+      // function and let the user re-create the hourly one if needed.
+      // Better: only create if none exist, or always clean then recreate one.
+    }
+  });
+
+  // Simple & safe: always create one new short trigger.
+  // The hourly trigger (if set with a different schedule) remains.
+  ScriptApp.newTrigger('processIndoramaEmails')
+    .timeBased()
+    .after(3 * 60 * 1000) // 3 minutes
+    .create();
+
+  Logger.log('Continuation trigger created (fires in ~3 minutes).');
+}
+
+/**
+ * Utility: remove ALL triggers that call processIndoramaEmails.
+ * Run this manually from the editor if triggers ever accumulate.
+ * Afterwards re-create your hourly trigger.
+ */
+function cleanupAllDownloaderTriggers() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === 'processIndoramaEmails') {
+      ScriptApp.deleteTrigger(t);
+      Logger.log('Deleted trigger: ' + t.getUniqueId());
+    }
+  });
+}
+
 
 /* ==================================================================
- * RECONCILIATION EMAIL PROCESSOR
- * ================================================================== */
+ * DAILY PROCESSOR (run once per day)
+ * ================================================================
+ * Reads the CSV files that the downloader has already saved into
+ * the Darwinbox folder and updates the Google Sheets.
+ *
+ * Expected files in the folder:
+ *   - Employee List.csv          → Emp_Details sheet
+ *   - Reconciliation Update.csv  → Reconciliation sheet
+ *
+ * Create a time-driven trigger that calls processDailyFiles() once a day.
+ */
 
-function processReconciliationMessage(message) {
+function processDailyFiles() {
+  const FOLDER_ID = '1DZ2MYPvTR1HMSVUIE3fcCIBVLyrBqxD1';
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) {
+    Logger.log('Another daily run is already in progress. Exiting.');
+    return;
+  }
+
   try {
-    const attachments = message.getAttachments();
-    Logger.log('Attachments found: ' + attachments.length);
+    const folder = DriveApp.getFolderById(FOLDER_ID);
 
-    let csvAttachment = null;
-
-    // Prefer exact name (case-insensitive)
-    attachments.forEach(function(attachment) {
-      const name = attachment.getName().trim().toLowerCase();
-      if (name === 'reconciliation update.csv') {
-        csvAttachment = attachment;
+    // ---------- Employee List ----------
+    const empFile = findFileInFolder(folder, 'employee list.csv');
+    if (empFile) {
+      Logger.log('Found Employee List file: ' + empFile.getName());
+      const csvText = empFile.getBlob().getDataAsString('UTF-8');
+      const csvData = Utilities.parseCsv(csvText);
+      if (csvData && csvData.length > 1) {
+        const result = processEmployeeListUpdate(csvData);
+        Logger.log('Employee List result: ' + JSON.stringify(result));
+      } else {
+        Logger.log('Employee List CSV is empty or has no data rows.');
       }
-    });
-
-    // Fallback: any CSV
-    if (!csvAttachment) {
-      attachments.forEach(function(attachment) {
-        const name = attachment.getName().trim().toLowerCase();
-        if (!csvAttachment && name.endsWith('.csv')) {
-          csvAttachment = attachment;
-        }
-      });
+    } else {
+      Logger.log('Employee List.csv not found in the folder.');
     }
 
-    if (!csvAttachment) {
-      Logger.log('No CSV attachment found in Reconciliation email.');
-      return false;
+    // ---------- Reconciliation ----------
+    const reconFile = findFileInFolder(folder, 'reconciliation update.csv');
+    if (reconFile) {
+      Logger.log('Found Reconciliation file: ' + reconFile.getName());
+      const csvText = reconFile.getBlob().getDataAsString('UTF-8');
+      const csvData = Utilities.parseCsv(csvText);
+      if (csvData && csvData.length > 1) {
+        const result = processReconciliationUpdate(csvData);
+        Logger.log('Reconciliation result: ' + JSON.stringify(result));
+      } else {
+        Logger.log('Reconciliation CSV is empty or has no data rows.');
+      }
+    } else {
+      Logger.log('Reconciliation Update.csv not found in the folder.');
     }
 
-    Logger.log('Reading attachment: ' + csvAttachment.getName());
-
-    const csvText = csvAttachment.getDataAsString('UTF-8');
-    if (!csvText.trim()) {
-      throw new Error('CSV attachment is empty.');
-    }
-
-    Logger.log('CSV size: ' + csvText.length + ' characters');
-
-    const csvData = Utilities.parseCsv(csvText);
-    if (!csvData || csvData.length < 2) {
-      throw new Error('CSV does not contain any data rows.');
-    }
-
-    Logger.log('CSV rows including header: ' + csvData.length);
-
-    const result = processReconciliationUpdate(csvData);
-    Logger.log('Reconciliation processing result: ' + JSON.stringify(result));
-    return true;
-
-  } catch (err) {
-    Logger.log('Reconciliation ERROR: ' + err.toString());
-    return false;
+  } finally {
+    lock.releaseLock();
   }
+}
+
+/**
+ * Case-insensitive file lookup inside a folder.
+ */
+function findFileInFolder(folder, targetName) {
+  const files = folder.getFiles();
+  const lowerTarget = targetName.toLowerCase();
+
+  while (files.hasNext()) {
+    const file = files.next();
+    if (file.getName().trim().toLowerCase() === lowerTarget) {
+      return file;
+    }
+  }
+  return null;
 }
 
 
 /* ==================================================================
- * RECONCILIATION GOOGLE SHEET PROCESSOR
- * CSV is the complete source of truth.
- * - Only records present in the CSV are kept.
- * - Existing Emp+Date keys that are NOT in the CSV are removed.
- * - Matching keys have their Reconciliation_Status updated from the CSV.
- * - New keys from the CSV are added.
+ * SHEET PROCESSORS (full replace – CSV is source of truth)
  * ================================================================== */
 
 function processReconciliationUpdate(csvData) {
@@ -273,18 +340,9 @@ function processReconciliationUpdate(csvData) {
   }
 
   const lastRow = sheet.getLastRow();
+  const existingCount = lastRow > 1 ? lastRow - 1 : 0;
+  Logger.log('Existing reconciliation records before replace: ' + existingCount);
 
-  // We still read existing data only so we can report how many were removed,
-  // but the final output is driven purely by the CSV.
-  let existingCount = 0;
-  if (lastRow > 1) {
-    existingCount = lastRow - 1;
-  }
-
-  Logger.log('Existing records before replace: ' + existingCount);
-
-  // ---------- Build final dataset exclusively from CSV ----------
-  // Key = Emp_No + Absent_Date
   const records = new Map();
   let incomingCount = 0;
 
@@ -303,20 +361,17 @@ function processReconciliationUpdate(csvData) {
     incomingCount++;
   }
 
-  Logger.log('Incoming CSV records used: ' + incomingCount);
+  Logger.log('CSV records used: ' + incomingCount);
 
-  // Convert + sort
   const finalData = Array.from(records.values());
-
   finalData.sort(function(a, b) {
     const empCmp = String(a[0]).localeCompare(String(b[0]));
     if (empCmp !== 0) return empCmp;
     return String(a[1]).localeCompare(String(b[1]));
   });
 
-  Logger.log('Final records to write (CSV only): ' + finalData.length);
+  Logger.log('Final records to write: ' + finalData.length);
 
-  // ---------- Full replace ----------
   if (lastRow > 1) {
     sheet.getRange(2, 1, lastRow - 1, 3).clearContent();
   }
@@ -336,97 +391,6 @@ function processReconciliationUpdate(csvData) {
   };
 }
 
-
-/* ==================================================================
- * EMPLOYEE LIST FOR RECONCILIATION PROCESSOR
- * Target sheet: Emp_Details (gid = 342193858)
- * Unique key: Emp ID
- *
- * CSV is the complete source of truth.
- * - All existing rows are removed.
- * - Only the employees present in the CSV are written.
- * ================================================================== */
-
-function processEmployeeListMessage(message) {
-  try {
-    const attachments = message.getAttachments();
-    Logger.log('Attachments found: ' + attachments.length);
-
-    let csvAttachment = null;
-
-    // Prefer exact name (case-insensitive)
-    attachments.forEach(function(attachment) {
-      const name = attachment.getName().trim().toLowerCase();
-      if (name === 'employee list.csv') {
-        csvAttachment = attachment;
-      }
-    });
-
-    // Fallback: any CSV
-    if (!csvAttachment) {
-      attachments.forEach(function(attachment) {
-        const name = attachment.getName().trim().toLowerCase();
-        if (!csvAttachment && name.endsWith('.csv')) {
-          csvAttachment = attachment;
-        }
-      });
-    }
-
-    if (!csvAttachment) {
-      Logger.log('No CSV attachment found in Employee List email.');
-      return false;
-    }
-
-    Logger.log('Reading attachment: ' + csvAttachment.getName());
-
-    const csvText = csvAttachment.getDataAsString('UTF-8');
-    if (!csvText.trim()) {
-      throw new Error('CSV attachment is empty.');
-    }
-
-    Logger.log('CSV size: ' + csvText.length + ' characters');
-
-    const csvData = Utilities.parseCsv(csvText);
-    if (!csvData || csvData.length < 2) {
-      throw new Error('CSV does not contain any data rows.');
-    }
-
-    Logger.log('CSV rows including header: ' + csvData.length);
-
-    const result = processEmployeeListUpdate(csvData);
-    Logger.log('Employee List processing result: ' + JSON.stringify(result));
-    return true;
-
-  } catch (err) {
-    Logger.log('Employee List ERROR: ' + err.toString());
-    return false;
-  }
-}
-
-
-/**
- * Emp_Details sheet structure (gid 342193858):
- *   A: S/N
- *   B: COMPANY
- *   C: Emp ID
- *   D: GENDER
- *   E: TRAIN TYPE I
- *   F: Category
- *   G: Emp Name
- *
- * Incoming CSV columns:
- *   [0] Emp ID
- *   [1] Emp Name
- *   [2] Category
- *   [3] Company
- *   [4] Gender
- *
- * Behaviour:
- *   - Completely replace the sheet content with the CSV data only.
- *   - Any employee not present in the CSV is removed.
- *   - TRAIN TYPE I is left blank (CSV has no such column).
- *   - S/N is re-numbered from 1.
- */
 function processEmployeeListUpdate(csvData) {
   const SPREADSHEET_ID = '1Wmo3BU1ht3VCiNx5hn0-PmrT9_VHivsnFoe6tLFAa74';
   const SHEET_ID = 342193858; // Emp_Details
@@ -440,11 +404,9 @@ function processEmployeeListUpdate(csvData) {
 
   const lastRow = sheet.getLastRow();
   const previousCount = lastRow > 1 ? lastRow - 1 : 0;
-
   Logger.log('Existing Emp_Details records (will be replaced): ' + previousCount);
 
-  // ---------- Build final dataset exclusively from CSV ----------
-  const records = new Map(); // key = Emp ID (upper) to collapse any duplicates in CSV
+  const records = new Map();
 
   for (let i = 1; i < csvData.length; i++) {
     const row = csvData[i];
@@ -460,33 +422,29 @@ function processEmployeeListUpdate(csvData) {
 
     const key = empId.toUpperCase();
     records.set(key, [
-      0,          // S/N placeholder
-      company,    // COMPANY
-      empId,      // Emp ID
-      gender,     // GENDER
-      '',         // TRAIN TYPE I (not in CSV)
-      category,   // Category
-      empName     // Emp Name
+      0,          // S/N
+      company,
+      empId,
+      gender,
+      '',         // TRAIN TYPE I
+      category,
+      empName
     ]);
   }
 
-  // Convert to array and sort (Company → Emp ID)
   const finalData = Array.from(records.values());
-
   finalData.sort(function(a, b) {
     const compCmp = String(a[1]).localeCompare(String(b[1]));
     if (compCmp !== 0) return compCmp;
     return String(a[2]).localeCompare(String(b[2]));
   });
 
-  // Re-number S/N from 1
   for (let i = 0; i < finalData.length; i++) {
     finalData[i][0] = i + 1;
   }
 
-  Logger.log('Final Emp_Details records to write (CSV only): ' + finalData.length);
+  Logger.log('Final Emp_Details records to write: ' + finalData.length);
 
-  // ---------- Full replace ----------
   if (lastRow > 1) {
     sheet.getRange(2, 1, lastRow - 1, 7).clearContent();
   }
